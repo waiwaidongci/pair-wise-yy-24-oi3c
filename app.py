@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from database import DomainError, RadioDB
+from database import CopyConflictError, DomainError, RadioDB
 
 BASE = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("RADIO_DB", str(BASE / "radio.db"))
@@ -90,6 +90,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/schedule/copy-week/preview":
+                plan = self.db.build_copy_plan(str(body.get("source_week_date", "")), str(body.get("region", "")))
+                return self._json(200, {"ok": plan["ok"], "plan": plan})
+            if parsed.path == "/api/schedule/copy-week":
+                try:
+                    result = self.db.copy_week(str(body.get("source_week_date", "")), str(body.get("region", "")))
+                except CopyConflictError as exc:
+                    return self._json(409, {"ok": False, "error": str(exc), "plan": exc.plan})
+                return self._json(201, {"ok": True, "result": result})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":

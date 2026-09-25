@@ -8,6 +8,10 @@ section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
 button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ddd;padding:4px 8px;text-align:left}
+.bad{color:#b00020;font-weight:600}.ok{color:#1b6e3b;font-weight:600}
+.warnbox{border:1px solid #e0b000;background:#fff8e1;border-radius:6px;padding:8px;margin:8px 0}
+.goodbox{border:1px solid #1b6e3b;background:#eef8f0;border-radius:6px;padding:8px;margin:8px 0}
 </style>
 <h1>电台播出与版权窗口排程</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
@@ -21,6 +25,13 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+<section><h2>复制到下周</h2>
+<p>按来源周内任意一天定位该周（周一至周日），按相同星期键位和开播时间映射到下周；只复制未取消排期。先预览并检查重叠、禁播、授权与赞助间隔，确认后才整套写入。</p>
+<div class="grid"><input id="copysource" value="2026-09-28" placeholder="来源周内任意日期">
+<input id="copyregion" value="华东" placeholder="地区"></div>
+<button onclick="copyPreview()">预览检查（不写入）</button>
+<button id="copyconfirm" onclick="copyCommit()" disabled style="background:#1b6e3b">确认整套保存到下周</button>
+<div id="copyout"></div></section>
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
@@ -30,6 +41,47 @@ function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:start
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const CONFLICT_TEXT={overlap:'目标周时间重叠',blocked:'撞禁播时段',out_of_license:'超出授权窗口',
+region_unauthorized:'地区未授权',program_inactive:'节目未启用',sponsor_gap:'赞助间隔不足',sponsor_overlap:'赞助节目撞档'};
+let copyParams=null;
+async function copyPreview(){
+  copyParams={source_week_date:copysource.value,region:copyregion.value};
+  document.querySelector('#copyconfirm').disabled=true;
+  const j=await (await fetch('/api/schedule/copy-week/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(copyParams)})).json();
+  renderCopy(j);
+}
+function renderCopy(j){
+  const box=document.querySelector('#copyout');
+  if(!j.ok&&!j.plan){box.innerHTML=`<div class="warnbox"><span class="bad">${esc(j.error)}</span></div>`;return}
+  const plan=j.plan;let html=`<p>来源周 ${esc(plan.source_week_start)} 起 → 目标周 <b>${esc(plan.target_week_start)}</b> 起，地区 ${esc(plan.region)}，共 ${plan.items.length} 条。</p>`;
+  const byItem={};(j.ok===false&&plan.conflicts?plan.conflicts:[]).forEach(c=>{(byItem[c.source_slot_id]??=[]).push(c)});
+  if(plan.conflicts.length){
+    html+=`<div class="warnbox"><span class="bad">发现 ${plan.conflicts.length} 处不合适，暂不写入；请先按下表处理后重新预览。</span></div>`;
+  }else{
+    html+=`<div class="goodbox"><span class="ok">无冲突，预览如下；确认后整套一次保存。</span></div>`;
+  }
+  html+=`<table><tr><th>来源排期</th><th>目标日期</th><th>时间</th><th>节目</th><th>时长</th><th>检查结果</th></tr>`;
+  for(const it of plan.items){
+    const cs=byItem[it.source_slot_id]||[];
+    const res=cs.length?`<span class="bad">${esc(cs.map(c=>CONFLICT_TEXT[c.kind]||c.kind+'：'+c.detail).join('；'))}</span>`:`<span class="ok">通过</span>`;
+    html+=`<tr><td>#${it.source_slot_id}（${esc(it.source_air_date)}${it.source_status==='replaced'?'，替换后':''}）</td><td>${esc(it.air_date)}</td><td>${esc(it.start_time)}</td><td>#${it.program_id} ${esc(it.title)}</td><td>${it.duration_minutes} 分</td><td>${res}</td></tr>`;
+    for(const c of cs) html+=`<tr><td colspan="6" class="bad">↳ ${esc(c.detail)}</td></tr>`;
+  }
+  html+=`</table>`;
+  box.innerHTML=html;
+  document.querySelector('#copyconfirm').disabled=!!plan.conflicts.length;
+}
+async function copyCommit(){
+  if(!copyParams)return;
+  const r=await fetch('/api/schedule/copy-week',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(copyParams)});
+  const j=await r.json();
+  if(!j.ok){renderCopy(j);return}
+  document.querySelector('#copyconfirm').disabled=true;
+  document.querySelector('#copyout').innerHTML=
+    `<div class="goodbox"><span class="ok">已整套保存 ${j.result.created_slot_ids.length} 条到目标周 ${esc(j.result.target_week_start)}（排期 ID：${j.result.created_slot_ids.join(', ')}）。可继续按普通排期替换、登记实播和对账。</span></div>`;
+  out(j);load();
+}
 load();
 </script>
 </html>
