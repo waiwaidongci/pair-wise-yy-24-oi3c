@@ -16,6 +16,10 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="duration" type="number" value="30" placeholder="分钟"><input id="start" value="2026-01-01"><input id="end" value="2026-12-31">
 <input id="region" value="华东"><input id="sponsor" placeholder="赞助商，可空"><input id="cooldown" type="number" value="0" placeholder="冷却分钟">
 </div><button onclick="addProgram()">创建并授权地区</button></section>
+<section><h2>复制到下周</h2>
+<div class="grid"><input id="copyweek" value="2026-09-28" placeholder="来源周内任意日期"><input id="copyregion" value="华东" placeholder="地区"></div>
+<button onclick="previewCopy()">检查并预览</button><button onclick="confirmCopy()">确认复制到下周</button>
+<pre id="copyresult"></pre></section>
 <section><h2>排期 / 替换 / 实播对账</h2>
 <div class="grid"><input id="airdate" value="2026-09-28"><input id="starttime" value="12:00"><input id="pid" type="number" placeholder="节目 ID">
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
@@ -30,6 +34,9 @@ function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:start
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+async function copyApi(url){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({week_start:copyweek.value,region:copyregion.value})});const j=await r.json();document.querySelector('#copyresult').textContent=JSON.stringify(j,null,2);return j}
+function previewCopy(){return copyApi('/api/schedule/copy-week/preview')}
+async function confirmCopy(){const j=await copyApi('/api/schedule/copy-week');if(j.ok){out(j);load()}}
 load();
 </script>
 </html>

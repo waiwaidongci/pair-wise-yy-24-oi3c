@@ -192,37 +192,39 @@ class RadioDB:
             )
         return int(cur.lastrowid)
 
-    def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
-                       region: str, ignore_slot_id: int | None = None) -> None:
+    def _slot_problems(self, air_date: str, start_time: str, duration: int, program_id: int,
+                       region: str, ignore_slot_id: int | None = None) -> list[str]:
+        """Collect every rule violation for a candidate slot instead of failing fast."""
         try:
             day = datetime.strptime(air_date, "%Y-%m-%d").date()
-        except ValueError as exc:
-            raise DomainError("播出日期必须使用 YYYY-MM-DD") from exc
+        except ValueError:
+            return ["播出日期必须使用 YYYY-MM-DD"]
         try:
-            _minutes(start_time)
-        except ValueError as exc:
-            raise DomainError("开始时间必须使用 HH:MM") from exc
+            start_minutes = _minutes(start_time)
+        except ValueError:
+            return ["开始时间必须使用 HH:MM"]
+        problems: list[str] = []
         if duration <= 0:
-            raise DomainError("排期时长必须大于0")
+            problems.append("排期时长必须大于0")
         program = self.conn.execute("SELECT * FROM programs WHERE id=? AND active=1", (program_id,)).fetchone()
         if not program:
-            raise DomainError("节目不存在或未启用")
+            return problems + ["节目不存在或未启用"]
         if program["duration_minutes"] != duration:
-            raise DomainError(f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟")
+            problems.append(f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟")
         if not (program["start_date"] <= air_date <= program["end_date"]):
-            raise DomainError("播出日期超出授权窗口")
+            problems.append("播出日期超出授权窗口")
         if not self.conn.execute(
             "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (program_id, region)
         ).fetchone():
-            raise DomainError(f"节目未授权在{region}播出")
-        end_minutes = _minutes(start_time) + duration
+            problems.append(f"节目未授权在{region}播出")
+        end_minutes = start_minutes + duration
         blocked = self.conn.execute(
             "SELECT * FROM blocked_windows WHERE region=? AND weekday=?",
             (region, day.weekday()),
         ).fetchall()
         for window in blocked:
-            if _minutes(window["start_time"]) < end_minutes and _minutes(start_time) < _minutes(window["end_time"]):
-                raise DomainError(f"与禁播时段冲突: {window['reason']}")
+            if _minutes(window["start_time"]) < end_minutes and start_minutes < _minutes(window["end_time"]):
+                problems.append(f"与禁播时段冲突: {window['reason']}")
         sql = "SELECT * FROM slots WHERE air_date=? AND region=? AND status!='cancelled'"
         params: list[object] = [air_date, region]
         if ignore_slot_id is not None:
@@ -230,7 +232,7 @@ class RadioDB:
             params.append(ignore_slot_id)
         for existing in self.conn.execute(sql, params).fetchall():
             if _overlap(start_time, duration, existing["start_time"], existing["duration_minutes"]):
-                raise DomainError(f"与排期 #{existing['id']} 时间重叠")
+                problems.append(f"与排期 #{existing['id']} 时间重叠")
         if program["cooldown_minutes"]:
             previous = self.conn.execute(
                 "SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND status!='cancelled' AND id!=? "
@@ -238,9 +240,9 @@ class RadioDB:
                 (air_date, region, program_id, ignore_slot_id or -1, start_time),
             ).fetchone()
             if previous:
-                gap = _minutes(start_time) - (_minutes(previous["start_time"]) + previous["duration_minutes"])
+                gap = start_minutes - (_minutes(previous["start_time"]) + previous["duration_minutes"])
                 if gap < program["cooldown_minutes"]:
-                    raise DomainError(f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟")
+                    problems.append(f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟")
         if program["sponsor"]:
             policy = self.conn.execute("SELECT min_gap_minutes FROM sponsor_policies WHERE sponsor=?", (program["sponsor"],)).fetchone()
             if policy:
@@ -252,10 +254,18 @@ class RadioDB:
                 ).fetchall()
                 for other in all_sponsored:
                     if _overlap(start_time, duration, other["start_time"], other["duration_minutes"]):
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的其他节目冲突")
-                    distance = abs(_minutes(start_time) - (_minutes(other["start_time"]) + other["duration_minutes"]))
+                        problems.append(f"与赞助商 {program['sponsor']} 的其他节目冲突")
+                        continue
+                    distance = abs(start_minutes - (_minutes(other["start_time"]) + other["duration_minutes"]))
                     if distance < gap:
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的节目间隔不足 {gap} 分钟")
+                        problems.append(f"与赞助商 {program['sponsor']} 的节目间隔不足 {gap} 分钟")
+        return problems
+
+    def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
+                       region: str, ignore_slot_id: int | None = None) -> None:
+        problems = self._slot_problems(air_date, start_time, duration, program_id, region, ignore_slot_id)
+        if problems:
+            raise DomainError(problems[0])
 
     def schedule_slot(self, air_date: str, start_time: str, program_id: int, region: str) -> int:
         program = self.conn.execute("SELECT duration_minutes FROM programs WHERE id=?", (program_id,)).fetchone()
@@ -268,6 +278,86 @@ class RadioDB:
                 (air_date, start_time, int(program["duration_minutes"]), program_id, region, datetime.now().isoformat()),
             )
         return int(cur.lastrowid)
+
+    @staticmethod
+    def _week_monday(any_date: str):
+        try:
+            day = datetime.strptime(any_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+        return day - timedelta(days=day.weekday())
+
+    def preview_copy_week(self, week_start: str, region: str) -> dict:
+        """Map one week's uncancelled slots onto the next week and check every target.
+
+        Returns {"ok": True, "slots": [...]} when the whole week can be copied, or
+        {"ok": False, "conflicts": [...]} listing each offending program and time.
+        Nothing is written in either case. Copied slots keep the source weekday,
+        start time and duration, so they stay consistent with each other; each
+        candidate only needs to be checked against what already exists.
+        """
+        region = region.strip()
+        if not region:
+            raise DomainError("地区不能为空")
+        monday = self._week_monday(week_start)
+        target_monday = monday + timedelta(days=7)
+        source_slots = self.conn.execute(
+            "SELECT s.*, p.title FROM slots s JOIN programs p ON p.id=s.program_id "
+            "WHERE s.region=? AND s.status!='cancelled' AND s.air_date BETWEEN ? AND ? "
+            "ORDER BY s.air_date, s.start_time",
+            (region, monday.isoformat(), (monday + timedelta(days=6)).isoformat()),
+        ).fetchall()
+        if not source_slots:
+            raise DomainError("来源周该地区没有可复制的排期")
+        plan: list[dict] = []
+        conflicts: list[dict] = []
+        for slot in source_slots:
+            offset = (datetime.strptime(slot["air_date"], "%Y-%m-%d").date() - monday).days
+            target_date = (target_monday + timedelta(days=offset)).isoformat()
+            problems = self._slot_problems(
+                target_date, slot["start_time"], slot["duration_minutes"], slot["program_id"], region
+            )
+            entry = {
+                "air_date": target_date,
+                "start_time": slot["start_time"],
+                "duration_minutes": slot["duration_minutes"],
+                "program_id": slot["program_id"],
+                "title": slot["title"],
+                "region": region,
+            }
+            if problems:
+                conflicts.append({**entry, "errors": problems})
+            else:
+                plan.append(entry)
+        if conflicts:
+            return {"ok": False, "week_start": target_monday.isoformat(), "conflicts": conflicts}
+        return {"ok": True, "week_start": target_monday.isoformat(), "slots": plan}
+
+    def copy_week(self, week_start: str, region: str) -> list[dict]:
+        """Persist a confirmed weekly copy as one atomic batch of planned slots."""
+        preview = self.preview_copy_week(week_start, region)
+        if not preview["ok"]:
+            summary = "；".join(
+                f"{c['air_date']} {c['start_time']} 《{c['title']}》: {'、'.join(c['errors'])}"
+                for c in preview["conflicts"]
+            )
+            raise DomainError(f"目标周存在冲突，未写入任何排期: {summary}")
+        with self.transaction():
+            ids = []
+            for slot in preview["slots"]:
+                # Re-validate inside the transaction so a concurrent change
+                # between preview and confirm still cannot write a bad plan.
+                self._validate_slot(
+                    slot["air_date"], slot["start_time"], slot["duration_minutes"],
+                    slot["program_id"], slot["region"],
+                )
+                cur = self.conn.execute(
+                    "INSERT INTO slots(air_date,start_time,duration_minutes,program_id,region,created_at) VALUES(?,?,?,?,?,?)",
+                    (slot["air_date"], slot["start_time"], slot["duration_minutes"],
+                     slot["program_id"], slot["region"], datetime.now().isoformat()),
+                )
+                ids.append(int(cur.lastrowid))
+        return [self.get_slot(slot_id) for slot_id in ids]
 
     def replace_slot(self, slot_id: int, new_program_id: int) -> dict:
         """Replace a planned item and revalidate the resulting plan atomically."""

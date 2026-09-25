@@ -80,6 +80,13 @@ class Handler(BaseHTTPRequestHandler):
                     int(body.get("program_id", 0)), str(body.get("region", "")),
                 )
                 return self._json(201, {"ok": True, "id": slot_id, "slot": self.db.get_slot(slot_id)})
+            if parsed.path == "/api/schedule/copy-week/preview":
+                return self._json(200, self.db.preview_copy_week(
+                    str(body.get("week_start", "")), str(body.get("region", "")),
+                ))
+            if parsed.path == "/api/schedule/copy-week":
+                slots = self.db.copy_week(str(body.get("week_start", "")), str(body.get("region", "")))
+                return self._json(201, {"ok": True, "slots": slots})
             if parsed.path == "/api/playout":
                 log_id = self.db.record_playout(
                     int(body.get("slot_id", 0)), str(body.get("actual_start", "")),
